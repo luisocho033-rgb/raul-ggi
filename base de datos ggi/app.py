@@ -1,314 +1,162 @@
 import json
-import re
 import sqlite3
 import os
 from pathlib import Path
-from datetime import date
-
 import groq
 import pandas as pd
 import streamlit as st
 
-# Configuración de rutas
+# Configuración
 DB_PATH = Path("asistencia.db")
 UPLOAD_DIR = Path("archivos_excel")
-UPLOAD_DIR.mkdir(exist_ok=True) # Crea la carpeta si no existe
-
+UPLOAD_DIR.mkdir(exist_ok=True)
 TABLE_NAME = "asistencia_diaria"
 
-# Se unifica bajo "identificador" para agrupar P00 y CI
-COLUMN_ALIASES = {
-    "fecha": ["fecha", "date", "dia", "día"],
-    "identificador": ["cedula_trabajador", "cedula", "id", "identificacion", "identificación", "ci", "dni", "c.i", "p00"],
-    "nombre_trabajador": ["nombre_trabajador", "nombre", "nombre_completo", "trabajador", "personal", "empleado"],
-    "departamento": ["departamento", "area", "área", "division", "división", "sector"],
-    "estatus": ["estatus", "estado", "asistencia", "situacion", "situación", "motivo", "ausencia", "observacion", "observación"],
-}
-REQUIRED_FIELDS = list(COLUMN_ALIASES.keys())
-AUSENCIAS = ("Vacaciones", "Teletrabajo", "Ausente")
-
-def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
-    """Inicializa la base de datos SQLite y crea la tabla de asistencia."""
-    conn = sqlite3.connect(path, check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute(
-        f"""
+def init_db():
+    """Crea la tabla con la columna 'identificador' unificada."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-            fecha TEXT NOT NULL,
-            identificador TEXT NOT NULL,
-            nombre_trabajador TEXT NOT NULL,
-            departamento TEXT NOT NULL,
-            estatus TEXT NOT NULL,
+            fecha TEXT,
+            identificador TEXT,
+            nombre_trabajador TEXT,
+            departamento TEXT,
+            estatus TEXT,
             PRIMARY KEY(fecha, identificador)
         )
-        """
-    )
-    conn.commit()
+    """)
     return conn
 
-def guess_column_by_content(df):
-    """Detecta las columnas mapeando alias o analizando el contenido."""
-    result = {}
-    lowered = {col.lower().strip(): col for col in df.columns}
-    
-    for field, aliases in COLUMN_ALIASES.items():
-        for alias in aliases:
-            if alias in lowered:
-                result[field] = lowered[alias]
-                break
-
-    for field in REQUIRED_FIELDS:
-        if field not in result:
-            candidates = []
-            for col in df.columns:
-                s = df[col]
-                if field == "fecha":
-                    num_dates = pd.to_datetime(s, errors="coerce").notna().sum()
-                    if num_dates > len(s) // 4:
-                        candidates.append((col, num_dates))
-                elif field == "identificador":
-                    mask = s.astype(str).str.match(r"^\d{6,9}$", na=False)
-                    if mask.sum() > len(s) // 2:
-                        candidates.append((col, mask.sum()))
-                elif field == "nombre_trabajador":
-                    ntext = s.astype(str).str.count(r" ").sum()
-                    if ntext > len(s) // 5:
-                        candidates.append((col, ntext))
-                elif field == "departamento":
-                    nunique = s.nunique()
-                    if nunique <= len(s) // 5:
-                        candidates.append((col, nunique))
-                elif field == "estatus":
-                    nunique = s.nunique()
-                    if nunique <= 12:
-                        candidates.append((col, nunique))
-            if candidates:
-                result[field] = sorted(candidates, key=lambda x: x[1], reverse=True)[0][0]
-                
-    missing = [f for f in REQUIRED_FIELDS if f not in result]
-    if missing:
-        st.warning("Faltan las siguientes columnas esenciales: " + ", ".join(missing))
-    return result
-
-def procesar_excel(file_path, conn):
-    """Procesa el archivo Excel físico y lo inserta en SQLite."""
+def procesar_flexible(file_path, conn):
     df = pd.read_excel(file_path, engine="openpyxl")
-    colmaps = guess_column_by_content(df)
-    dfout = pd.DataFrame()
+    # Limpieza de nombres de columnas del Excel
+    df.columns = [c.lower().strip() for c in df.columns]
     
-    for std, orig in colmaps.items():
-        dfout[std] = df[orig]
+    # Buscamos la columna de ID (P00 o CI) con varios nombres posibles
+    posibles_ids = [c for c in df.columns if any(x in c for x in ["ced", "ci", "p00", "id", "identific"])]
+    posibles_nombres = [c for c in df.columns if any(x in c for x in ["nom", "trabajador", "empleado"])]
+    posibles_fechas = [c for c in df.columns if any(x in c for x in ["fech", "dia", "date"])]
+    posibles_deptos = [c for c in df.columns if any(x in c for x in ["dep", "area", "div"])]
+    posibles_status = [c for c in df.columns if any(x in c for x in ["est", "situ", "motivo", "asist"])]
 
-    dfout["fecha"] = pd.to_datetime(dfout["fecha"], errors="coerce").dt.date
-    dfout["identificador"] = dfout["identificador"].astype(str).str.strip()
-    dfout["nombre_trabajador"] = dfout["nombre_trabajador"].astype(str).str.strip()
-    dfout["departamento"] = dfout["departamento"].astype(str).str.strip()
-    dfout["estatus"] = dfout["estatus"].astype(str).str.strip().str.title()
-
-    dfout = dfout.dropna(subset=REQUIRED_FIELDS)
-    dfout["fecha"] = dfout["fecha"].astype(str)
-
-    values = [tuple(row) for row in dfout.to_numpy(dtype=object)]
-    cursor = conn.cursor()
-    prior_changes = conn.total_changes
-    cursor.executemany(
-        f"""
-        INSERT OR IGNORE INTO {TABLE_NAME}
-        (fecha, identificador, nombre_trabajador, departamento, estatus)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        values,
-    )
-    conn.commit()
-    inserted = conn.total_changes - prior_changes
-    return inserted, len(values)
-
-def init_groq_client() -> groq.Client:
-    api_key = st.secrets.get("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("La clave GROQ_API_KEY no está configurada en st.secrets.")
-    return groq.Client(api_key=api_key)
-
-def generar_sql(prompt: str, client: groq.Client) -> str:
-    system_prompt = (
-        "Eres un experto en SQL SQLite. "
-        "La tabla 'asistencia_diaria' tiene: fecha, identificador, nombre_trabajador, departamento, estatus. "
-        "REGLA VITAL: La columna 'identificador' contiene tanto el P00 (si tiene exactamente 6 caracteres numéricos) "
-        "como la Cédula/CI (si tiene más de 6 caracteres numéricos). "
-        "Genera solo código SQL válido SELECT o WITH. No incluyas explicaciones."
-    )
-    user_prompt = f"Pregunta: {prompt}\nGenera solo la consulta SQL."
-    full_prompt = f"{system_prompt}\n\n{user_prompt}"
-
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": full_prompt}],
-        max_tokens=256,
-        temperature=0.0,
-    )
+    df_final = pd.DataFrame()
     
-    return response.choices[0].message.content.strip().rstrip(";")
+    # Asignación segura: si existe la columna en el Excel, la mapeamos a nuestro estándar
+    if posibles_fechas: 
+        df_final["fecha"] = pd.to_datetime(df[posibles_fechas[0]], errors='coerce').dt.strftime('%Y-%m-%d')
+    if posibles_ids: 
+        df_final["identificador"] = df[posibles_ids[0]].astype(str).str.replace(".0", "", regex=False)
+    if posibles_nombres: 
+        df_final["nombre_trabajador"] = df[posibles_nombres[0]].astype(str)
+    if posibles_deptos: 
+        df_final["departamento"] = df[posibles_deptos[0]].astype(str)
+    if posibles_status: 
+        df_final["estatus"] = df[posibles_status[0]].astype(str)
 
-def validar_sql(sql: str) -> None:
-    if not sql:
-        raise ValueError("Consulta vacía.")
-    if ";" in sql:
-        raise ValueError("No usar punto y coma.")
-    if not re.match(r"^(SELECT|WITH)\b", sql.strip(), re.IGNORECASE):
-        raise ValueError("Sólo SELECT o WITH permitidos.")
-    prohibited = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "ATTACH", "DETACH", "PRAGMA"]
-    for token in prohibited:
-        if re.search(rf"\b{token}\b", sql, re.IGNORECASE):
-            raise ValueError(f"Instrucción SQL prohibida: {token}.")
+    # Insertar en la DB (si hay datos)
+    if not df_final.empty:
+        df_final.to_sql(TABLE_NAME, conn, if_exists='append', index=False)
+        return len(df_final)
+    return 0
 
-def ejecutar_sql(conn: sqlite3.Connection, sql: str) -> pd.DataFrame:
-    validar_sql(sql)
-    cursor = conn.cursor()
-    cursor.execute(sql)
-    columns = [desc[0] for desc in cursor.description] if cursor.description else []
-    return pd.DataFrame(cursor.fetchall(), columns=columns)
-
-def resumir_resultado(question: str, sql: str, df: pd.DataFrame, client: groq.Client) -> str:
-    if df.empty:
-        return "No se encontraron registros para esta consulta."
-    
-    records = df.to_dict(orient="records")
-    result_text = json.dumps(records[:20], ensure_ascii=False)
-
-    prompt = (
-        f"Pregunta del usuario: {question}\n"
-        f"Datos extraídos: {result_text}\n"
-        "Responde en español de forma analítica y directa. "
-        "Recuerda que identificadores de 6 dígitos son P00 y los de más de 6 dígitos son CI. "
-        "No muestres el SQL."
-    )
-    
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=400,
-        temperature=0.3,
-    )
-    
-    return response.choices[0].message.content.strip()
-
-def resumen_ausencias(conn: sqlite3.Connection):
-    """Muestra la tabla de ausencias procesadas de la DB."""
-    query = f"""
-    SELECT 
-        identificador, 
-        CASE 
-            WHEN LENGTH(identificador) = 6 THEN 'P00' 
-            ELSE 'CI' 
-        END AS tipo_id,
-        nombre_trabajador, 
-        estatus AS motivo, 
-        fecha
-    FROM {TABLE_NAME}
-    WHERE estatus IN {AUSENCIAS}
-    ORDER BY identificador, fecha
-    """
-    try:
-        df = pd.read_sql_query(query, conn)
-        if df.empty:
-            return
-
-        df['fecha'] = pd.to_datetime(df['fecha'])
-        df['grupo'] = (df['fecha'].diff().dt.days.ne(1) | 
-                       (df['identificador'] != df['identificador'].shift(1)) | 
-                       (df['motivo'] != df['motivo'].shift(1))).cumsum()
-        resumen = (
-            df.groupby(['identificador', 'tipo_id', 'nombre_trabajador', 'motivo', 'grupo'])
-            .agg(fecha_inicio=('fecha', 'min'), fecha_fin=('fecha', 'max'))
-            .reset_index()
-            .drop('grupo', axis=1)
-            .sort_values(['fecha_inicio'])
-        )
-        resumen['fecha_inicio'] = resumen['fecha_inicio'].dt.strftime('%Y-%m-%d')
-        resumen['fecha_fin'] = resumen['fecha_fin'].dt.strftime('%Y-%m-%d')
-
-        st.dataframe(resumen, use_container_width=True)
-    except Exception as e:
-        st.error(f"Error interno en tabla visual: {e}")
-
-def main() -> None:
-    st.set_page_config(page_title="Gestión de Asistencia ggi", layout="wide")
+def main():
+    st.set_page_config(page_title="Gestión ggi", layout="wide")
     st.title("Gestión de Asistencia Masiva para ggi")
 
     conn = init_db()
-    client = init_groq_client()
+    
+    # API Groq - Modelo Llama 3.1 8B (Gratis y rápido)
+    api_key = st.secrets.get("GROQ_API_KEY")
+    client = groq.Client(api_key=api_key) if api_key else None
 
-    # --- ZONA DE GESTIÓN DE ARCHIVOS ---
-    with st.expander("Subir y Guardar Archivo Excel", expanded=True):
-        uploaded_file = st.file_uploader("Sube el archivo (.xlsx)", type=["xlsx"])
-        
-        if uploaded_file is not None:
-            custom_name = st.text_input("Asigna un nombre para identificar este archivo (sin .xlsx)", value=uploaded_file.name.replace(".xlsx", ""))
-            
-            if st.button("Guardar y Procesar en Base de Datos"):
-                if custom_name.strip() == "":
-                    st.error("El nombre no puede estar vacío.")
-                else:
-                    file_path = UPLOAD_DIR / f"{custom_name}.xlsx"
-                    with open(file_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    
-                    try:
-                        inserted, total = procesar_excel(file_path, conn)
-                        if inserted > 0:
-                            st.success(f"Guardado. Se importaron {inserted} registros nuevos de {total} procesados.")
-                        else:
-                            st.info("Archivo guardado. No hay registros nuevos (ya existían).")
-                    except Exception as exc:
-                        st.error(f"Error al procesar: {exc}")
-                        file_path.unlink(missing_ok=True) # Revierte si hay error
-
-    with st.expander("Archivos Guardados en el Servidor", expanded=False):
-        archivos = list(UPLOAD_DIR.glob("*.xlsx"))
-        if not archivos:
-            st.write("No hay archivos guardados.")
-        else:
-            for archivo in archivos:
-                col1, col2 = st.columns([4, 1])
-                col1.write(f"📄 {archivo.name}")
-                if col2.button("Borrar", key=archivo.name):
-                    archivo.unlink()
+    # PANEL LATERAL: GESTIÓN DE ARCHIVOS
+    with st.sidebar:
+        st.header("Carga de Datos")
+        uploaded_file = st.file_uploader("Subir archivo Excel", type=["xlsx"])
+        if uploaded_file:
+            nombre_personalizado = st.text_input("Nombre para este archivo", value=uploaded_file.name)
+            if st.button("Guardar y Procesar"):
+                path = UPLOAD_DIR / f"{nombre_personalizado}.xlsx"
+                with open(path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                try:
+                    regs = procesar_flexible(path, conn)
+                    st.success(f"Se cargaron {regs} registros correctamente.")
                     st.rerun()
+                except Exception as e:
+                    st.error(f"Error al guardar: {e}")
 
-    # --- TABLA DE DATOS ---
-    resumen_ausencias(conn)
+        st.markdown("---")
+        st.header("Archivos guardados")
+        for arc in UPLOAD_DIR.glob("*.xlsx"):
+            c1, c2 = st.columns([3, 1])
+            c1.text(f"📄 {arc.name}")
+            if c2.button("🗑️", key=str(arc)):
+                arc.unlink()
+                st.rerun()
 
-    # --- CHAT IA ---
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    # TABLA VISUAL DE AUSENCIAS (La que daba el error)
+    st.subheader("Resumen de Novedades (P00 y CI)")
+    try:
+        # Consulta corregida con los nombres exactos de la tabla
+        query = f"""
+        SELECT 
+            identificador, 
+            CASE WHEN LENGTH(identificador) = 6 THEN 'P00' ELSE 'CI' END AS tipo,
+            nombre_trabajador, 
+            estatus, 
+            fecha 
+        FROM {TABLE_NAME} 
+        WHERE estatus LIKE '%Vacaciones%' OR estatus LIKE '%Teletrabajo%' OR estatus LIKE '%Ausente%'
+        ORDER BY fecha DESC
+        """
+        data_view = pd.read_sql(query, conn)
+        if not data_view.empty:
+            st.dataframe(data_view, use_container_width=True)
+        else:
+            st.info("No hay registros de ausencias detectados aún.")
+    except Exception as e:
+        st.error(f"Error al leer la tabla: {e}")
 
+    # CHAT IA
     st.markdown("---")
-    st.subheader("Consultas de Asistencia (IA)")
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.write(m["content"])
 
-    user_prompt = st.chat_input("Consulta algo. Ejemplo: ¿Cuántas ausencias tiene el P00 123456?")
-    if user_prompt:
-        st.session_state.chat_history.append({"role": "user", "content": user_prompt})
-        with st.chat_message("assistant"):
-            st.write("Analizando...")
+    if p := st.chat_input("Ej: ¿Cuántas veces faltó el P00 123456?"):
+        st.session_state.messages.append({"role": "user", "content": p})
+        with st.chat_message("user"): st.write(p)
 
-        try:
-            sql_query = generar_sql(user_prompt, client)
-            df_result = ejecutar_sql(conn, sql_query)
-            answer = resumir_resultado(user_prompt, sql_query, df_result, client)
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
-            st.rerun()
-        except Exception as exc:
-            st.session_state.chat_history.append({"role": "assistant", "content": f"Fallo en consulta: {exc}"})
-            st.rerun()
-
-    st.sidebar.header("Estado")
-    st.sidebar.write(f"DB: {DB_PATH.name}")
-    st.sidebar.write(f"Directorio: {UPLOAD_DIR.name}/")
-    st.sidebar.write(f"Fecha: {date.today().isoformat()}")
+        if client:
+            try:
+                # 1. Generar SQL usando el esquema real
+                sys_sql = "Responde SOLO con el código SQL SELECT para SQLite. Tabla: asistencia_diaria. Columnas: fecha, identificador, nombre_trabajador, departamento, estatus."
+                res_sql = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "system", "content": sys_sql}, {"role": "user", "content": p}],
+                    temperature=0
+                )
+                sql_limpio = res_sql.choices[0].message.content.strip().replace("```sql", "").replace("
+```", "")
+                
+                # 2. Consultar y Resumir
+                res_df = pd.read_sql(sql_limpio, conn)
+                res_ia = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        {"role": "system", "content": "Eres un analista de RRHH para ggi. Explica los datos brevemente. Identificadores de 6 números son P00, otros son CI."},
+                        {"role": "user", "content": f"Datos: {res_df.to_json()} \nPregunta: {p}"}
+                    ]
+                )
+                msg_ia = res_ia.choices[0].message.content
+                with st.chat_message("assistant"): st.write(msg_ia)
+                st.session_state.messages.append({"role": "assistant", "content": msg_ia})
+            except:
+                st.error("No pude procesar esa consulta. Verifica que los datos estén cargados.")
 
 if __name__ == "__main__":
     main()
