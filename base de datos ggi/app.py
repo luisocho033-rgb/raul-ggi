@@ -12,7 +12,7 @@ DB_PATH = Path("asistencia.db")
 TABLE_NAME = "asistencia_diaria"
 COLUMN_ALIASES = {
     "fecha": ["fecha", "date", "dia", "día"],
-    "cedula_trabajador": ["cedula_trabajador", "cedula", "id", "identificacion", "identificación", "ci", "dni"],
+    "cedula_trabajador": ["cedula_trabajador", "cedula", "id", "identificacion", "identificación", "ci", "dni", "c.i"],
     "nombre_trabajador": ["nombre_trabajador", "nombre", "nombre_completo", "trabajador", "personal", "empleado"],
     "departamento": ["departamento", "area", "área", "division", "división", "sector"],
     "estatus": ["estatus", "estado", "asistencia", "situacion", "situación", "motivo", "ausencia", "observacion", "observación"],
@@ -130,22 +130,6 @@ def init_groq_client() -> groq.Client:
         raise RuntimeError("La clave GROQ_API_KEY no está configurada en st.secrets.")
     return groq.Client(api_key=api_key)
 
-def extract_groq_text(response) -> str:
-    """Extrae texto de la respuesta de Groq de forma robusta."""
-    if hasattr(response, "output_text") and response.output_text:
-        return response.output_text.strip()
-    if isinstance(response, dict):
-        output = response.get("output")
-        if isinstance(output, list) and output:
-            first = output[0]
-            if isinstance(first, dict):
-                content = first.get("content")
-                if isinstance(content, list):
-                    return "".join(item.get("text", "") for item in content if isinstance(item, dict)).strip()
-                if isinstance(content, str):
-                    return content.strip()
-    return str(response).strip()
-
 def generar_sql(prompt: str, client: groq.Client) -> str:
     """Genera una consulta SQL SELECT para SQLite a partir de la pregunta del usuario."""
     system_prompt = (
@@ -160,14 +144,15 @@ def generar_sql(prompt: str, client: groq.Client) -> str:
     )
     full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model="llama3-70b-8192",
-        input=full_prompt,
+        messages=[{"role": "user", "content": full_prompt}],
         max_tokens=512,
         temperature=0.0,
     )
-    sql = extract_groq_text(response)
-    sql = sql.strip().rstrip(";")
+    
+    sql = response.choices[0].message.content.strip()
+    sql = sql.rstrip(";")
     return sql
 
 def validar_sql(sql: str) -> None:
@@ -212,13 +197,15 @@ def resumir_resultado(question: str, sql: str, df: pd.DataFrame, client: groq.Cl
         f"SQL ejecutado: {sql}\n"
         f"Resultados: {result_text}"
     )
-    response = client.responses.create(
+    
+    response = client.chat.completions.create(
         model="llama3-70b-8192",
-        input=prompt,
+        messages=[{"role": "user", "content": prompt}],
         max_tokens=512,
         temperature=0.3,
     )
-    return extract_groq_text(response)
+    
+    return response.choices[0].message.content.strip()
 
 def resumen_ausencias(conn: sqlite3.Connection):
     """Cálculo y despliegue del resumen de ausencias por persona y periodo."""
@@ -314,12 +301,14 @@ def main() -> None:
             df_result = ejecutar_sql(conn, sql_query)
             answer = resumir_resultado(user_prompt, sql_query, df_result, client)
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            st.rerun() # Opcional: fuerza la recarga visual inmediata
         except Exception as exc:
             error_message = (
                 "No se pudo obtener la respuesta automática. "
                 f"Detalle técnico: {exc}"
             )
             st.session_state.chat_history.append({"role": "assistant", "content": error_message})
+            st.rerun() # Opcional: fuerza la recarga visual inmediata
 
     st.sidebar.header("Estado del sistema")
     st.sidebar.write(f"Base de datos: {DB_PATH.name}")
