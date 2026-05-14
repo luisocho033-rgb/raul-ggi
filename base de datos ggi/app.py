@@ -30,10 +30,8 @@ def init_db():
 def procesar_flexible(file_path, conn):
     """Lee el Excel y mapea columnas automáticamente al estándar de la DB."""
     df = pd.read_excel(file_path, engine="openpyxl")
-    # Normalizar nombres de columnas del Excel para buscarlas fácilmente
     df.columns = [c.lower().strip() for c in df.columns]
     
-    # Identificar columnas por palabras clave (sin requerimientos estrictos)
     posibles_ids = [c for c in df.columns if any(x in c for x in ["ced", "ci", "p00", "id", "identific"])]
     posibles_nombres = [c for c in df.columns if any(x in c for x in ["nom", "trabajador", "empleado"])]
     posibles_fechas = [c for c in df.columns if any(x in c for x in ["fech", "dia", "date"])]
@@ -45,7 +43,6 @@ def procesar_flexible(file_path, conn):
     if posibles_fechas: 
         df_final["fecha"] = pd.to_datetime(df[posibles_fechas[0]], errors='coerce').dt.strftime('%Y-%m-%d')
     if posibles_ids: 
-        # Limpiar el ID: quitar decimales si vienen del Excel (.0)
         df_final["identificador"] = df[posibles_ids[0]].astype(str).str.replace(".0", "", regex=False).str.strip()
     if posibles_nombres: 
         df_final["nombre_trabajador"] = df[posibles_nombres[0]].astype(str).str.strip()
@@ -55,7 +52,6 @@ def procesar_flexible(file_path, conn):
         df_final["estatus"] = df[posibles_status[0]].astype(str).str.strip()
 
     if not df_final.empty:
-        # Usamos 'REPLACE' para actualizar registros si ya existen la misma fecha e ID
         df_final.to_sql(TABLE_NAME, conn, if_exists='append', index=False)
         return len(df_final)
     return 0
@@ -65,8 +61,6 @@ def main():
     st.title("Gestión de Asistencia Masiva para ggi")
 
     conn = init_db()
-    
-    # Configuración de Groq (Modelo rápido y gratuito)
     api_key = st.secrets.get("GROQ_API_KEY")
     client = groq.Client(api_key=api_key) if api_key else None
 
@@ -75,7 +69,6 @@ def main():
         st.header("📂 Carga de Datos")
         uploaded_file = st.file_uploader("Subir archivo Excel", type=["xlsx"])
         if uploaded_file:
-            # Nombre para identificar el archivo en la lista
             nombre_sugerido = uploaded_file.name.replace(".xlsx", "")
             nombre_id = st.text_input("Nombre para identificar este archivo", value=nombre_sugerido)
             
@@ -93,8 +86,6 @@ def main():
         st.markdown("---")
         st.header("📋 Archivos Guardados")
         archivos = list(UPLOAD_DIR.glob("*.xlsx"))
-        if not archivos:
-            st.info("No hay archivos en el servidor.")
         for arc in archivos:
             col_name, col_del = st.columns([4, 1])
             col_name.text(f"📄 {arc.name}")
@@ -102,10 +93,9 @@ def main():
                 arc.unlink()
                 st.rerun()
 
-    # --- VISTA PRINCIPAL: TABLA DE NOVEDADES ---
+    # --- VISTA PRINCIPAL ---
     st.subheader("Resumen General de Novedades")
     try:
-        # Buscamos ausencias típicas para mostrar en la tabla principal
         query_view = f"""
             SELECT identificador, 
                    CASE WHEN LENGTH(identificador) = 6 THEN 'P00' ELSE 'CI' END AS tipo,
@@ -120,11 +110,11 @@ def main():
         if not data_view.empty:
             st.dataframe(data_view, use_container_width=True)
         else:
-            st.info("Sube archivos para visualizar las novedades aquí.")
+            st.info("No hay novedades detectadas.")
     except Exception as e:
-        st.error(f"Error al cargar tabla visual: {e}")
+        st.error(f"Error en tabla: {e}")
 
-    # --- CHAT CON INTELIGENCIA ARTIFICIAL ---
+    # --- CHAT CON IA ---
     st.markdown("---")
     st.subheader("💬 Consultar con IA")
     
@@ -135,40 +125,33 @@ def main():
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
-    if p := st.chat_input("Ej: ¿Cuántas vacaciones tiene el P00 123456 este mes?"):
+    if p := st.chat_input("Consulta algo..."):
         st.session_state.messages.append({"role": "user", "content": p})
         with st.chat_message("user"):
             st.markdown(p)
 
-        if not client:
-            st.warning("Falta la clave de API de Groq en los secretos.")
-        else:
+        if client:
             try:
-                # 1. Generación de SQL
-                sys_sql = (
-                    "Eres un experto en SQLite. Tabla: 'asistencia_diaria'. "
-                    "Columnas: fecha, identificador, nombre_trabajador, departamento, estatus. "
-                    "Responde SOLO con el código SQL SELECT."
-                )
+                # 1. Generar SQL
+                sys_sql = "Responde SOLO con SQL SELECT. Tabla: asistencia_diaria. Columnas: fecha, identificador, nombre_trabajador, departamento, estatus."
                 res_sql = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=[{"role": "system", "content": sys_sql}, {"role": "user", "content": p}],
                     temperature=0
                 )
                 
-                # Limpieza del SQL generado
-                sql_final = res_sql.choices[0].message.content.strip()
-                sql_final = sql_final.replace("```sql", "").replace("
+                # LIMPIEZA DE SQL (Aquí estaba el error de la comilla)
+                raw_sql = res_sql.choices[0].message.content.strip()
+                sql_final = raw_sql.replace("```sql", "").replace("
 ```", "").replace(";", "")
                 
-                # 2. Ejecución y Resumen
+                # 2. Consultar y responder
                 df_res = pd.read_sql(sql_final, conn)
-                
                 res_ia = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=[
-                        {"role": "system", "content": "Eres un analista de RRHH para ggi. Explica los resultados de forma directa. Recuerda: 6 dígitos es P00, más es CI."},
-                        {"role": "user", "content": f"Pregunta: {p} \n Datos obtenidos: {df_res.to_json(orient='records')}"}
+                        {"role": "system", "content": "Analista de ggi. 6 dígitos = P00, +6 = CI. Sé directo."},
+                        {"role": "user", "content": f"Pregunta: {p} \n Datos: {df_res.to_json(orient='records')}"}
                     ]
                 )
                 
@@ -178,8 +161,7 @@ def main():
                 st.session_state.messages.append({"role": "assistant", "content": respuesta})
                 
             except Exception as e:
-                error_msg = "No encontré datos suficientes para esa consulta o el formato es inválido."
-                st.error(f"{error_msg} (Detalle: {e})")
+                st.error(f"Consulta fallida: {e}")
 
 if __name__ == "__main__":
     main()
