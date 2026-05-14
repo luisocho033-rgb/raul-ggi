@@ -1,6 +1,7 @@
 import json
 import re
 import sqlite3
+import os
 from pathlib import Path
 from datetime import date
 
@@ -8,11 +9,17 @@ import groq
 import pandas as pd
 import streamlit as st
 
+# Configuración de rutas
 DB_PATH = Path("asistencia.db")
+UPLOAD_DIR = Path("archivos_excel")
+UPLOAD_DIR.mkdir(exist_ok=True) # Crea la carpeta si no existe
+
 TABLE_NAME = "asistencia_diaria"
+
+# Se unifica bajo "identificador" para agrupar P00 y CI
 COLUMN_ALIASES = {
     "fecha": ["fecha", "date", "dia", "día"],
-    "cedula_trabajador": ["cedula_trabajador", "cedula", "id", "identificacion", "identificación", "ci", "dni", "c.i"],
+    "identificador": ["cedula_trabajador", "cedula", "id", "identificacion", "identificación", "ci", "dni", "c.i", "p00"],
     "nombre_trabajador": ["nombre_trabajador", "nombre", "nombre_completo", "trabajador", "personal", "empleado"],
     "departamento": ["departamento", "area", "área", "division", "división", "sector"],
     "estatus": ["estatus", "estado", "asistencia", "situacion", "situación", "motivo", "ausencia", "observacion", "observación"],
@@ -21,18 +28,18 @@ REQUIRED_FIELDS = list(COLUMN_ALIASES.keys())
 AUSENCIAS = ("Vacaciones", "Teletrabajo", "Ausente")
 
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
-    """Inicializa la base de datos SQLite y crea la tabla de asistencia si no existe."""
+    """Inicializa la base de datos SQLite y crea la tabla de asistencia."""
     conn = sqlite3.connect(path, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
             fecha TEXT NOT NULL,
-            cedula_trabajador TEXT NOT NULL,
+            identificador TEXT NOT NULL,
             nombre_trabajador TEXT NOT NULL,
             departamento TEXT NOT NULL,
             estatus TEXT NOT NULL,
-            PRIMARY KEY(fecha, cedula_trabajador)
+            PRIMARY KEY(fecha, identificador)
         )
         """
     )
@@ -40,67 +47,60 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     return conn
 
 def guess_column_by_content(df):
-    """Intenta detectar automáticamente las columnas esenciales analizando contenido y encabezados."""
+    """Detecta las columnas mapeando alias o analizando el contenido."""
     result = {}
     lowered = {col.lower().strip(): col for col in df.columns}
-    # Busca primero por alias en encabezado
+    
     for field, aliases in COLUMN_ALIASES.items():
         for alias in aliases:
             if alias in lowered:
                 result[field] = lowered[alias]
                 break
 
-    # Si no se encuentra por alias, intenta por contenido
     for field in REQUIRED_FIELDS:
         if field not in result:
             candidates = []
             for col in df.columns:
                 s = df[col]
-                # Detecta fecha
                 if field == "fecha":
                     num_dates = pd.to_datetime(s, errors="coerce").notna().sum()
-                    if num_dates > len(s) // 4: # Al menos 25% parecen fechas
+                    if num_dates > len(s) // 4:
                         candidates.append((col, num_dates))
-                # Detecta cédula (5-9 dígitos)
-                elif field == "cedula_trabajador":
-                    mask = s.astype(str).str.match(r"^\d{5,9}$", na=False)
+                elif field == "identificador":
+                    mask = s.astype(str).str.match(r"^\d{6,9}$", na=False)
                     if mask.sum() > len(s) // 2:
                         candidates.append((col, mask.sum()))
-                # Detecta nombre (múltiples palabras)
                 elif field == "nombre_trabajador":
                     ntext = s.astype(str).str.count(r" ").sum()
                     if ntext > len(s) // 5:
                         candidates.append((col, ntext))
-                # Detecta departamento (pocos únicos)
                 elif field == "departamento":
                     nunique = s.nunique()
                     if nunique <= len(s) // 5:
                         candidates.append((col, nunique))
-                # Detecta estatus (pocos únicos)
                 elif field == "estatus":
                     nunique = s.nunique()
                     if nunique <= 12:
                         candidates.append((col, nunique))
             if candidates:
-                # Elige el que más coincide
                 result[field] = sorted(candidates, key=lambda x: x[1], reverse=True)[0][0]
-    # Aviso si falta alguna
+                
     missing = [f for f in REQUIRED_FIELDS if f not in result]
     if missing:
-        st.warning("No se detectaron las siguientes columnas, es posible que la información esté incompleta: " + ", ".join(missing))
+        st.warning("Faltan las siguientes columnas esenciales: " + ", ".join(missing))
     return result
 
-def procesar_excel(uploaded_file, conn):
-    """Procesa el archivo Excel, detecta columnas y graba en SQLite."""
-    df = pd.read_excel(uploaded_file, engine="openpyxl")
+def procesar_excel(file_path, conn):
+    """Procesa el archivo Excel físico y lo inserta en SQLite."""
+    df = pd.read_excel(file_path, engine="openpyxl")
     colmaps = guess_column_by_content(df)
     dfout = pd.DataFrame()
+    
     for std, orig in colmaps.items():
         dfout[std] = df[orig]
 
-    # Normalize
     dfout["fecha"] = pd.to_datetime(dfout["fecha"], errors="coerce").dt.date
-    dfout["cedula_trabajador"] = dfout["cedula_trabajador"].astype(str).str.strip()
+    dfout["identificador"] = dfout["identificador"].astype(str).str.strip()
     dfout["nombre_trabajador"] = dfout["nombre_trabajador"].astype(str).str.strip()
     dfout["departamento"] = dfout["departamento"].astype(str).str.strip()
     dfout["estatus"] = dfout["estatus"].astype(str).str.strip().str.title()
@@ -114,7 +114,7 @@ def procesar_excel(uploaded_file, conn):
     cursor.executemany(
         f"""
         INSERT OR IGNORE INTO {TABLE_NAME}
-        (fecha, cedula_trabajador, nombre_trabajador, departamento, estatus)
+        (fecha, identificador, nombre_trabajador, departamento, estatus)
         VALUES (?, ?, ?, ?, ?)
         """,
         values,
@@ -124,118 +124,101 @@ def procesar_excel(uploaded_file, conn):
     return inserted, len(values)
 
 def init_groq_client() -> groq.Client:
-    """Inicializa el cliente Groq usando la clave en st.secrets."""
     api_key = st.secrets.get("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("La clave GROQ_API_KEY no está configurada en st.secrets.")
     return groq.Client(api_key=api_key)
 
 def generar_sql(prompt: str, client: groq.Client) -> str:
-    """Genera una consulta SQL SELECT para SQLite a partir de la pregunta del usuario."""
     system_prompt = (
-        "Eres un asistente experto en SQL SQLite. "
-        "La base de datos contiene la tabla asistencia_diaria con columnas: fecha, cedula_trabajador, nombre_trabajador, departamento, estatus. "
-        "Devuelve únicamente una consulta SQL válida de tipo SELECT o WITH. "
-        "No incluyas explicaciones, no incluyas formato de texto adicional y no uses punto y coma final."
+        "Eres un experto en SQL SQLite. "
+        "La tabla 'asistencia_diaria' tiene: fecha, identificador, nombre_trabajador, departamento, estatus. "
+        "REGLA VITAL: La columna 'identificador' contiene tanto el P00 (si tiene exactamente 6 caracteres numéricos) "
+        "como la Cédula/CI (si tiene más de 6 caracteres numéricos). "
+        "Genera solo código SQL válido SELECT o WITH. No incluyas explicaciones."
     )
-    user_prompt = (
-        f"Pregunta: {prompt}\n"
-        "Genera solo la consulta SQL."
-    )
+    user_prompt = f"Pregunta: {prompt}\nGenera solo la consulta SQL."
     full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
     response = client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": full_prompt}],
-        max_tokens=512,
+        max_tokens=256,
         temperature=0.0,
     )
     
-    sql = response.choices[0].message.content.strip()
-    sql = sql.rstrip(";")
-    return sql
+    return response.choices[0].message.content.strip().rstrip(";")
 
 def validar_sql(sql: str) -> None:
-    """Valida que la consulta SQL sea segura y sólo permita SELECT/ WITH."""
     if not sql:
-        raise ValueError("La consulta SQL generada está vacía.")
+        raise ValueError("Consulta vacía.")
     if ";" in sql:
-        raise ValueError("La consulta SQL no puede contener punto y coma.")
+        raise ValueError("No usar punto y coma.")
     if not re.match(r"^(SELECT|WITH)\b", sql.strip(), re.IGNORECASE):
-        raise ValueError("Sólo se permiten consultas SELECT o WITH en esta interfaz.")
+        raise ValueError("Sólo SELECT o WITH permitidos.")
     prohibited = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "ATTACH", "DETACH", "PRAGMA"]
     for token in prohibited:
         if re.search(rf"\b{token}\b", sql, re.IGNORECASE):
-            raise ValueError(f"Consulta SQL no permitida: {token}.")
+            raise ValueError(f"Instrucción SQL prohibida: {token}.")
 
 def ejecutar_sql(conn: sqlite3.Connection, sql: str) -> pd.DataFrame:
-    """Ejecuta la consulta SQL y devuelve el resultado en un DataFrame."""
     validar_sql(sql)
     cursor = conn.cursor()
     cursor.execute(sql)
-    columns = [description[0] for description in cursor.description] if cursor.description else []
-    rows = cursor.fetchall()
-    return pd.DataFrame(rows, columns=columns)
+    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+    return pd.DataFrame(cursor.fetchall(), columns=columns)
 
 def resumir_resultado(question: str, sql: str, df: pd.DataFrame, client: groq.Client) -> str:
-    """Envía el resultado de la consulta a Groq para que lo redacte en español con detalle."""
     if df.empty:
-        result_text = "[]"
-    else:
-        records = df.to_dict(orient="records")
-        sample = records[:50]
-        result_text = json.dumps(sample, ensure_ascii=False, indent=2)
-        if len(records) > 50:
-            result_text += f"\n... (se muestran los primeros 50 de {len(records)} registros)"
+        return "No se encontraron registros para esta consulta."
+    
+    records = df.to_dict(orient="records")
+    result_text = json.dumps(records[:20], ensure_ascii=False)
 
     prompt = (
-        "Eres un redactor experto en la información mostrada. "
-        "Recibe la pregunta del usuario, la consulta SQL ejecutada y el resultado en JSON. "
-        "Responde en español con lujo de detalle, de forma clara y amigable. "
-        "No incluyas la consulta SQL en la respuesta final, solo el análisis y la conclusión.\n\n"
-        f"Pregunta: {question}\n"
-        f"SQL ejecutado: {sql}\n"
-        f"Resultados: {result_text}"
+        f"Pregunta del usuario: {question}\n"
+        f"Datos extraídos: {result_text}\n"
+        "Responde en español de forma analítica y directa. "
+        "Recuerda que identificadores de 6 dígitos son P00 y los de más de 6 dígitos son CI. "
+        "No muestres el SQL."
     )
     
     response = client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=512,
+        max_tokens=400,
         temperature=0.3,
     )
     
     return response.choices[0].message.content.strip()
 
 def resumen_ausencias(conn: sqlite3.Connection):
-    """Cálculo y despliegue del resumen de ausencias por persona y periodo."""
-    st.markdown("## Resumen de ausencias (Vacaciones, Teletrabajo, Ausente, solo CI 6 dígitos)")
+    """Muestra la tabla de ausencias procesadas de la DB."""
     query = f"""
     SELECT 
-        cedula_trabajador, 
+        identificador, 
+        CASE 
+            WHEN LENGTH(identificador) = 6 THEN 'P00' 
+            ELSE 'CI' 
+        END AS tipo_id,
         nombre_trabajador, 
         estatus AS motivo, 
         fecha
     FROM {TABLE_NAME}
-    WHERE 
-        estatus IN {AUSENCIAS}
-        AND LENGTH(cedula_trabajador) = 6
-        AND cedula_trabajador GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'
-    ORDER BY 
-        cedula_trabajador, motivo, fecha
+    WHERE estatus IN {AUSENCIAS}
+    ORDER BY identificador, fecha
     """
     try:
         df = pd.read_sql_query(query, conn)
         if df.empty:
-            st.info("No se encontraron ausencias para CIs de 6 dígitos.")
             return
 
         df['fecha'] = pd.to_datetime(df['fecha'])
         df['grupo'] = (df['fecha'].diff().dt.days.ne(1) | 
-                       (df['cedula_trabajador'] != df['cedula_trabajador'].shift(1)) | 
+                       (df['identificador'] != df['identificador'].shift(1)) | 
                        (df['motivo'] != df['motivo'].shift(1))).cumsum()
         resumen = (
-            df.groupby(['cedula_trabajador', 'nombre_trabajador', 'motivo', 'grupo'])
+            df.groupby(['identificador', 'tipo_id', 'nombre_trabajador', 'motivo', 'grupo'])
             .agg(fecha_inicio=('fecha', 'min'), fecha_fin=('fecha', 'max'))
             .reset_index()
             .drop('grupo', axis=1)
@@ -245,75 +228,87 @@ def resumen_ausencias(conn: sqlite3.Connection):
         resumen['fecha_fin'] = resumen['fecha_fin'].dt.strftime('%Y-%m-%d')
 
         st.dataframe(resumen, use_container_width=True)
-        st.markdown(
-            "_Muestra sólo períodos con días consecutivos por cada motivo y persona (Verifica que tu Excel tenga registros diarios para precisión)._"
-        )
     except Exception as e:
-        st.error(f"Error al calcular el resumen de ausencias: {e}")
+        st.error(f"Error interno en tabla visual: {e}")
 
 def main() -> None:
-    """Aplicación Streamlit principal."""
-    st.set_page_config(page_title="Gestión de Asistencia RRHH", layout="wide")
-    st.title("Gestión de Asistencia Masiva para RRHH")
-    st.write(
-        "Sube un archivo .xlsx diario para registrar la asistencia, y usa la consulta de chat para analizar la información.")
+    st.set_page_config(page_title="Gestión de Asistencia ggi", layout="wide")
+    st.title("Gestión de Asistencia Masiva para ggi")
 
     conn = init_db()
     client = init_groq_client()
 
-    with st.expander("Carga diaria de asistencia", expanded=True):
-        uploaded_file = st.file_uploader(
-            "Sube el archivo de asistencia (.xlsx)",
-            type=["xlsx"],
-            accept_multiple_files=False,
-        )
+    # --- ZONA DE GESTIÓN DE ARCHIVOS ---
+    with st.expander("Subir y Guardar Archivo Excel", expanded=True):
+        uploaded_file = st.file_uploader("Sube el archivo (.xlsx)", type=["xlsx"])
+        
         if uploaded_file is not None:
-            try:
-                inserted, total = procesar_excel(uploaded_file, conn)
-                if inserted > 0:
-                    st.success(f"Se importaron {inserted} registros nuevos de {total} filas procesadas.")
+            custom_name = st.text_input("Asigna un nombre para identificar este archivo (sin .xlsx)", value=uploaded_file.name.replace(".xlsx", ""))
+            
+            if st.button("Guardar y Procesar en Base de Datos"):
+                if custom_name.strip() == "":
+                    st.error("El nombre no puede estar vacío.")
                 else:
-                    st.info(
-                        "No se insertaron registros nuevos. El archivo parece corresponder a fechas ya cargadas o los registros ya existían.")
-            except Exception as exc:
-                st.error(f"Error al procesar el archivo: {exc}")
+                    file_path = UPLOAD_DIR / f"{custom_name}.xlsx"
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    
+                    try:
+                        inserted, total = procesar_excel(file_path, conn)
+                        if inserted > 0:
+                            st.success(f"Guardado. Se importaron {inserted} registros nuevos de {total} procesados.")
+                        else:
+                            st.info("Archivo guardado. No hay registros nuevos (ya existían).")
+                    except Exception as exc:
+                        st.error(f"Error al procesar: {exc}")
+                        file_path.unlink(missing_ok=True) # Revierte si hay error
 
+    with st.expander("Archivos Guardados en el Servidor", expanded=False):
+        archivos = list(UPLOAD_DIR.glob("*.xlsx"))
+        if not archivos:
+            st.write("No hay archivos guardados.")
+        else:
+            for archivo in archivos:
+                col1, col2 = st.columns([4, 1])
+                col1.write(f"📄 {archivo.name}")
+                if col2.button("Borrar", key=archivo.name):
+                    archivo.unlink()
+                    st.rerun()
+
+    # --- TABLA DE DATOS ---
     resumen_ausencias(conn)
 
+    # --- CHAT IA ---
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
     st.markdown("---")
-    st.subheader("Chat de consultas SQL para asistencia")
+    st.subheader("Consultas de Asistencia (IA)")
 
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
-    user_prompt = st.chat_input("Haz una pregunta sobre asistencia, por ejemplo: ¿Quién faltó más veces en el año en infraestructura?")
+    user_prompt = st.chat_input("Consulta algo. Ejemplo: ¿Cuántas ausencias tiene el P00 123456?")
     if user_prompt:
         st.session_state.chat_history.append({"role": "user", "content": user_prompt})
         with st.chat_message("assistant"):
-            st.write("Procesando tu solicitud... esto puede tardar unos segundos.")
+            st.write("Analizando...")
 
         try:
             sql_query = generar_sql(user_prompt, client)
             df_result = ejecutar_sql(conn, sql_query)
             answer = resumir_resultado(user_prompt, sql_query, df_result, client)
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
-            st.rerun() # Opcional: fuerza la recarga visual inmediata
+            st.rerun()
         except Exception as exc:
-            error_message = (
-                "No se pudo obtener la respuesta automática. "
-                f"Detalle técnico: {exc}"
-            )
-            st.session_state.chat_history.append({"role": "assistant", "content": error_message})
-            st.rerun() # Opcional: fuerza la recarga visual inmediata
+            st.session_state.chat_history.append({"role": "assistant", "content": f"Fallo en consulta: {exc}"})
+            st.rerun()
 
-    st.sidebar.header("Estado del sistema")
-    st.sidebar.write(f"Base de datos: {DB_PATH.name}")
-    st.sidebar.write(f"Tabla: {TABLE_NAME}")
-    st.sidebar.write(f"Fecha del servidor: {date.today().isoformat()}")
+    st.sidebar.header("Estado")
+    st.sidebar.write(f"DB: {DB_PATH.name}")
+    st.sidebar.write(f"Directorio: {UPLOAD_DIR.name}/")
+    st.sidebar.write(f"Fecha: {date.today().isoformat()}")
 
 if __name__ == "__main__":
     main()
