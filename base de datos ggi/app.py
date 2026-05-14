@@ -8,18 +8,17 @@ import groq
 import pandas as pd
 import streamlit as st
 
-# Configuración de la base de datos SQLite local
 DB_PATH = Path("asistencia.db")
 TABLE_NAME = "asistencia_diaria"
-REQUIRED_COLUMNS = ["fecha", "cedula_trabajador", "nombre_trabajador", "departamento", "estatus"]
 COLUMN_ALIASES = {
-    "fecha": ["fecha", "date", "dia"],
-    "cedula_trabajador": ["cedula_trabajador", "cedula", "id", "identificacion", "identificacion_trabajador"],
-    "nombre_trabajador": ["nombre_trabajador", "nombre", "nombre_completo", "trabajador"],
-    "departamento": ["departamento", "area", "division"],
-    "estatus": ["estatus", "estado", "asistencia", "situacion"],
+    "fecha": ["fecha", "date", "dia", "día"],
+    "cedula_trabajador": ["cedula_trabajador", "cedula", "id", "identificacion", "identificación", "ci", "dni"],
+    "nombre_trabajador": ["nombre_trabajador", "nombre", "nombre_completo", "trabajador", "personal", "empleado"],
+    "departamento": ["departamento", "area", "área", "division", "división", "sector"],
+    "estatus": ["estatus", "estado", "asistencia", "situacion", "situación", "motivo", "ausencia", "observacion", "observación"],
 }
-
+REQUIRED_FIELDS = list(COLUMN_ALIASES.keys())
+AUSENCIAS = ("Vacaciones", "Teletrabajo", "Ausente")
 
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     """Inicializa la base de datos SQLite y crea la tabla de asistencia si no existe."""
@@ -40,47 +39,82 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     conn.commit()
     return conn
 
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza nombres de columnas del Excel usando alias simples."""
-    lowercase = {col.lower().strip(): col for col in df.columns}
-    rename_map = {}
-    for target, aliases in COLUMN_ALIASES.items():
+def guess_column_by_content(df):
+    """Intenta detectar automáticamente las columnas esenciales analizando contenido y encabezados."""
+    result = {}
+    lowered = {col.lower().strip(): col for col in df.columns}
+    # Busca primero por alias en encabezado
+    for field, aliases in COLUMN_ALIASES.items():
         for alias in aliases:
-            if alias in lowercase:
-                rename_map[lowercase[alias]] = target
+            if alias in lowered:
+                result[field] = lowered[alias]
                 break
-    return df.rename(columns=rename_map)
 
-
-def procesar_excel(uploaded_file, conn: sqlite3.Connection) -> tuple[int, int]:
-    """Procesa el archivo Excel y guarda registros únicos en SQLite."""
-    df = pd.read_excel(uploaded_file, engine="openpyxl")
-    df = normalize_columns(df)
-
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    # Si no se encuentra por alias, intenta por contenido
+    for field in REQUIRED_FIELDS:
+        if field not in result:
+            candidates = []
+            for col in df.columns:
+                s = df[col]
+                # Detecta fecha
+                if field == "fecha":
+                    num_dates = pd.to_datetime(s, errors="coerce").notna().sum()
+                    if num_dates > len(s) // 4: # Al menos 25% parecen fechas
+                        candidates.append((col, num_dates))
+                # Detecta cédula (5-9 dígitos)
+                elif field == "cedula_trabajador":
+                    mask = s.astype(str).str.match(r"^\d{5,9}$", na=False)
+                    if mask.sum() > len(s) // 2:
+                        candidates.append((col, mask.sum()))
+                # Detecta nombre (múltiples palabras)
+                elif field == "nombre_trabajador":
+                    ntext = s.astype(str).str.count(r" ").sum()
+                    if ntext > len(s) // 5:
+                        candidates.append((col, ntext))
+                # Detecta departamento (pocos únicos)
+                elif field == "departamento":
+                    nunique = s.nunique()
+                    if nunique <= len(s) // 5:
+                        candidates.append((col, nunique))
+                # Detecta estatus (pocos únicos)
+                elif field == "estatus":
+                    nunique = s.nunique()
+                    if nunique <= 12:
+                        candidates.append((col, nunique))
+            if candidates:
+                # Elige el que más coincide
+                result[field] = sorted(candidates, key=lambda x: x[1], reverse=True)[0][0]
+    # Aviso si falta alguna
+    missing = [f for f in REQUIRED_FIELDS if f not in result]
     if missing:
-        raise ValueError(
-            f"Columnas faltantes en el archivo Excel: {', '.join(missing)}. "
-            "Asegúrate de incluir fecha, cedula_trabajador, nombre_trabajador, departamento y estatus."
-        )
+        st.warning("No se detectaron las siguientes columnas, es posible que la información esté incompleta: " + ", ".join(missing))
+    return result
 
-    df = df[REQUIRED_COLUMNS].copy()
-    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
-    df["cedula_trabajador"] = df["cedula_trabajador"].astype(str).str.strip()
-    df["nombre_trabajador"] = df["nombre_trabajador"].astype(str).str.strip()
-    df["departamento"] = df["departamento"].astype(str).str.strip()
-    df["estatus"] = df["estatus"].astype(str).str.strip().str.title()
+def procesar_excel(uploaded_file, conn):
+    """Procesa el archivo Excel, detecta columnas y graba en SQLite."""
+    df = pd.read_excel(uploaded_file, engine="openpyxl")
+    colmaps = guess_column_by_content(df)
+    dfout = pd.DataFrame()
+    for std, orig in colmaps.items():
+        dfout[std] = df[orig]
 
-    df = df.dropna(subset=["fecha", "cedula_trabajador", "nombre_trabajador", "departamento", "estatus"])
-    df["fecha"] = df["fecha"].astype(str)
+    # Normalize
+    dfout["fecha"] = pd.to_datetime(dfout["fecha"], errors="coerce").dt.date
+    dfout["cedula_trabajador"] = dfout["cedula_trabajador"].astype(str).str.strip()
+    dfout["nombre_trabajador"] = dfout["nombre_trabajador"].astype(str).str.strip()
+    dfout["departamento"] = dfout["departamento"].astype(str).str.strip()
+    dfout["estatus"] = dfout["estatus"].astype(str).str.strip().str.title()
 
-    values = [tuple(row) for row in df.to_numpy(dtype=object)]
+    dfout = dfout.dropna(subset=REQUIRED_FIELDS)
+    dfout["fecha"] = dfout["fecha"].astype(str)
+
+    values = [tuple(row) for row in dfout.to_numpy(dtype=object)]
     cursor = conn.cursor()
     prior_changes = conn.total_changes
     cursor.executemany(
         f"""
-        INSERT OR IGNORE INTO {TABLE_NAME} (fecha, cedula_trabajador, nombre_trabajador, departamento, estatus)
+        INSERT OR IGNORE INTO {TABLE_NAME}
+        (fecha, cedula_trabajador, nombre_trabajador, departamento, estatus)
         VALUES (?, ?, ?, ?, ?)
         """,
         values,
@@ -89,14 +123,12 @@ def procesar_excel(uploaded_file, conn: sqlite3.Connection) -> tuple[int, int]:
     inserted = conn.total_changes - prior_changes
     return inserted, len(values)
 
-
 def init_groq_client() -> groq.Client:
     """Inicializa el cliente Groq usando la clave en st.secrets."""
     api_key = st.secrets.get("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("La clave GROQ_API_KEY no está configurada en st.secrets.")
     return groq.Client(api_key=api_key)
-
 
 def extract_groq_text(response) -> str:
     """Extrae texto de la respuesta de Groq de forma robusta."""
@@ -113,7 +145,6 @@ def extract_groq_text(response) -> str:
                 if isinstance(content, str):
                     return content.strip()
     return str(response).strip()
-
 
 def generar_sql(prompt: str, client: groq.Client) -> str:
     """Genera una consulta SQL SELECT para SQLite a partir de la pregunta del usuario."""
@@ -139,7 +170,6 @@ def generar_sql(prompt: str, client: groq.Client) -> str:
     sql = sql.strip().rstrip(";")
     return sql
 
-
 def validar_sql(sql: str) -> None:
     """Valida que la consulta SQL sea segura y sólo permita SELECT/ WITH."""
     if not sql:
@@ -153,7 +183,6 @@ def validar_sql(sql: str) -> None:
         if re.search(rf"\b{token}\b", sql, re.IGNORECASE):
             raise ValueError(f"Consulta SQL no permitida: {token}.")
 
-
 def ejecutar_sql(conn: sqlite3.Connection, sql: str) -> pd.DataFrame:
     """Ejecuta la consulta SQL y devuelve el resultado en un DataFrame."""
     validar_sql(sql)
@@ -162,7 +191,6 @@ def ejecutar_sql(conn: sqlite3.Connection, sql: str) -> pd.DataFrame:
     columns = [description[0] for description in cursor.description] if cursor.description else []
     rows = cursor.fetchall()
     return pd.DataFrame(rows, columns=columns)
-
 
 def resumir_resultado(question: str, sql: str, df: pd.DataFrame, client: groq.Client) -> str:
     """Envía el resultado de la consulta a Groq para que lo redacte en español con detalle."""
@@ -192,6 +220,49 @@ def resumir_resultado(question: str, sql: str, df: pd.DataFrame, client: groq.Cl
     )
     return extract_groq_text(response)
 
+def resumen_ausencias(conn: sqlite3.Connection):
+    """Cálculo y despliegue del resumen de ausencias por persona y periodo."""
+    st.markdown("## Resumen de ausencias (Vacaciones, Teletrabajo, Ausente, solo CI 6 dígitos)")
+    query = f"""
+    SELECT 
+        cedula_trabajador, 
+        nombre_trabajador, 
+        estatus AS motivo, 
+        fecha
+    FROM {TABLE_NAME}
+    WHERE 
+        estatus IN {AUSENCIAS}
+        AND LENGTH(cedula_trabajador) = 6
+        AND cedula_trabajador GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'
+    ORDER BY 
+        cedula_trabajador, motivo, fecha
+    """
+    try:
+        df = pd.read_sql_query(query, conn)
+        if df.empty:
+            st.info("No se encontraron ausencias para CIs de 6 dígitos.")
+            return
+
+        df['fecha'] = pd.to_datetime(df['fecha'])
+        df['grupo'] = (df['fecha'].diff().dt.days.ne(1) | 
+                       (df['cedula_trabajador'] != df['cedula_trabajador'].shift(1)) | 
+                       (df['motivo'] != df['motivo'].shift(1))).cumsum()
+        resumen = (
+            df.groupby(['cedula_trabajador', 'nombre_trabajador', 'motivo', 'grupo'])
+            .agg(fecha_inicio=('fecha', 'min'), fecha_fin=('fecha', 'max'))
+            .reset_index()
+            .drop('grupo', axis=1)
+            .sort_values(['fecha_inicio'])
+        )
+        resumen['fecha_inicio'] = resumen['fecha_inicio'].dt.strftime('%Y-%m-%d')
+        resumen['fecha_fin'] = resumen['fecha_fin'].dt.strftime('%Y-%m-%d')
+
+        st.dataframe(resumen, use_container_width=True)
+        st.markdown(
+            "_Muestra sólo períodos con días consecutivos por cada motivo y persona (Verifica que tu Excel tenga registros diarios para precisión)._"
+        )
+    except Exception as e:
+        st.error(f"Error al calcular el resumen de ausencias: {e}")
 
 def main() -> None:
     """Aplicación Streamlit principal."""
@@ -219,6 +290,8 @@ def main() -> None:
                         "No se insertaron registros nuevos. El archivo parece corresponder a fechas ya cargadas o los registros ya existían.")
             except Exception as exc:
                 st.error(f"Error al procesar el archivo: {exc}")
+
+    resumen_ausencias(conn)
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -252,7 +325,6 @@ def main() -> None:
     st.sidebar.write(f"Base de datos: {DB_PATH.name}")
     st.sidebar.write(f"Tabla: {TABLE_NAME}")
     st.sidebar.write(f"Fecha del servidor: {date.today().isoformat()}")
-
 
 if __name__ == "__main__":
     main()
