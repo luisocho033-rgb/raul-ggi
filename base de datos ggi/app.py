@@ -140,10 +140,11 @@ def main():
                     temperature=0
                 )
                 
-                # LIMPIEZA DE SQL (Aquí estaba el error de la comilla)
+                # LIMPIEZA DE SQL SEGURA
                 raw_sql = res_sql.choices[0].message.content.strip()
                 sql_final = raw_sql.replace("```sql", "").replace("
-```", "").replace(";", "")
+```", "")
+                sql_final = sql_final.replace(";", "").strip()
                 
                 # 2. Consultar y responder
                 df_res = pd.read_sql(sql_final, conn)
