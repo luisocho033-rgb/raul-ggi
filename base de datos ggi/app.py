@@ -6,14 +6,14 @@ import groq
 import pandas as pd
 import streamlit as st
 
-# Configuración
+# --- CONFIGURACIÓN DE RUTAS Y TABLAS ---
 DB_PATH = Path("asistencia.db")
 UPLOAD_DIR = Path("archivos_excel")
 UPLOAD_DIR.mkdir(exist_ok=True)
 TABLE_NAME = "asistencia_diaria"
 
 def init_db():
-    """Crea la tabla con la columna 'identificador' unificada."""
+    """Inicializa la base de datos con la columna unificada 'identificador'."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -28,11 +28,12 @@ def init_db():
     return conn
 
 def procesar_flexible(file_path, conn):
+    """Lee el Excel y mapea columnas automáticamente al estándar de la DB."""
     df = pd.read_excel(file_path, engine="openpyxl")
-    # Limpieza de nombres de columnas del Excel
+    # Normalizar nombres de columnas del Excel para buscarlas fácilmente
     df.columns = [c.lower().strip() for c in df.columns]
     
-    # Buscamos la columna de ID (P00 o CI) con varios nombres posibles
+    # Identificar columnas por palabras clave (sin requerimientos estrictos)
     posibles_ids = [c for c in df.columns if any(x in c for x in ["ced", "ci", "p00", "id", "identific"])]
     posibles_nombres = [c for c in df.columns if any(x in c for x in ["nom", "trabajador", "empleado"])]
     posibles_fechas = [c for c in df.columns if any(x in c for x in ["fech", "dia", "date"])]
@@ -41,20 +42,20 @@ def procesar_flexible(file_path, conn):
 
     df_final = pd.DataFrame()
     
-    # Asignación segura: si existe la columna en el Excel, la mapeamos a nuestro estándar
     if posibles_fechas: 
         df_final["fecha"] = pd.to_datetime(df[posibles_fechas[0]], errors='coerce').dt.strftime('%Y-%m-%d')
     if posibles_ids: 
-        df_final["identificador"] = df[posibles_ids[0]].astype(str).str.replace(".0", "", regex=False)
+        # Limpiar el ID: quitar decimales si vienen del Excel (.0)
+        df_final["identificador"] = df[posibles_ids[0]].astype(str).str.replace(".0", "", regex=False).str.strip()
     if posibles_nombres: 
-        df_final["nombre_trabajador"] = df[posibles_nombres[0]].astype(str)
+        df_final["nombre_trabajador"] = df[posibles_nombres[0]].astype(str).str.strip()
     if posibles_deptos: 
-        df_final["departamento"] = df[posibles_deptos[0]].astype(str)
+        df_final["departamento"] = df[posibles_deptos[0]].astype(str).str.strip()
     if posibles_status: 
-        df_final["estatus"] = df[posibles_status[0]].astype(str)
+        df_final["estatus"] = df[posibles_status[0]].astype(str).str.strip()
 
-    # Insertar en la DB (si hay datos)
     if not df_final.empty:
+        # Usamos 'REPLACE' para actualizar registros si ya existen la misma fecha e ID
         df_final.to_sql(TABLE_NAME, conn, if_exists='append', index=False)
         return len(df_final)
     return 0
@@ -65,98 +66,120 @@ def main():
 
     conn = init_db()
     
-    # API Groq - Modelo Llama 3.1 8B (Gratis y rápido)
+    # Configuración de Groq (Modelo rápido y gratuito)
     api_key = st.secrets.get("GROQ_API_KEY")
     client = groq.Client(api_key=api_key) if api_key else None
 
-    # PANEL LATERAL: GESTIÓN DE ARCHIVOS
+    # --- BARRA LATERAL: GESTIÓN DE ARCHIVOS ---
     with st.sidebar:
-        st.header("Carga de Datos")
+        st.header("📂 Carga de Datos")
         uploaded_file = st.file_uploader("Subir archivo Excel", type=["xlsx"])
         if uploaded_file:
-            nombre_personalizado = st.text_input("Nombre para este archivo", value=uploaded_file.name)
-            if st.button("Guardar y Procesar"):
-                path = UPLOAD_DIR / f"{nombre_personalizado}.xlsx"
+            # Nombre para identificar el archivo en la lista
+            nombre_sugerido = uploaded_file.name.replace(".xlsx", "")
+            nombre_id = st.text_input("Nombre para identificar este archivo", value=nombre_sugerido)
+            
+            if st.button("Guardar y Cargar a DB"):
+                path = UPLOAD_DIR / f"{nombre_id}.xlsx"
                 with open(path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 try:
                     regs = procesar_flexible(path, conn)
-                    st.success(f"Se cargaron {regs} registros correctamente.")
+                    st.success(f"¡Éxito! {regs} registros procesados.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error al guardar: {e}")
+                    st.error(f"Error al procesar: {e}")
 
         st.markdown("---")
-        st.header("Archivos guardados")
-        for arc in UPLOAD_DIR.glob("*.xlsx"):
-            c1, c2 = st.columns([3, 1])
-            c1.text(f"📄 {arc.name}")
-            if c2.button("🗑️", key=str(arc)):
+        st.header("📋 Archivos Guardados")
+        archivos = list(UPLOAD_DIR.glob("*.xlsx"))
+        if not archivos:
+            st.info("No hay archivos en el servidor.")
+        for arc in archivos:
+            col_name, col_del = st.columns([4, 1])
+            col_name.text(f"📄 {arc.name}")
+            if col_del.button("🗑️", key=str(arc)):
                 arc.unlink()
                 st.rerun()
 
-    # TABLA VISUAL DE AUSENCIAS (La que daba el error)
-    st.subheader("Resumen de Novedades (P00 y CI)")
+    # --- VISTA PRINCIPAL: TABLA DE NOVEDADES ---
+    st.subheader("Resumen General de Novedades")
     try:
-        # Consulta corregida con los nombres exactos de la tabla
-        query = f"""
-        SELECT 
-            identificador, 
-            CASE WHEN LENGTH(identificador) = 6 THEN 'P00' ELSE 'CI' END AS tipo,
-            nombre_trabajador, 
-            estatus, 
-            fecha 
-        FROM {TABLE_NAME} 
-        WHERE estatus LIKE '%Vacaciones%' OR estatus LIKE '%Teletrabajo%' OR estatus LIKE '%Ausente%'
-        ORDER BY fecha DESC
+        # Buscamos ausencias típicas para mostrar en la tabla principal
+        query_view = f"""
+            SELECT identificador, 
+                   CASE WHEN LENGTH(identificador) = 6 THEN 'P00' ELSE 'CI' END AS tipo,
+                   nombre_trabajador, estatus, fecha 
+            FROM {TABLE_NAME} 
+            WHERE estatus LIKE '%Vacaciones%' 
+               OR estatus LIKE '%Teletrabajo%' 
+               OR estatus LIKE '%Ausente%'
+            ORDER BY fecha DESC LIMIT 50
         """
-        data_view = pd.read_sql(query, conn)
+        data_view = pd.read_sql(query_view, conn)
         if not data_view.empty:
             st.dataframe(data_view, use_container_width=True)
         else:
-            st.info("No hay registros de ausencias detectados aún.")
+            st.info("Sube archivos para visualizar las novedades aquí.")
     except Exception as e:
-        st.error(f"Error al leer la tabla: {e}")
+        st.error(f"Error al cargar tabla visual: {e}")
 
-    # CHAT IA
+    # --- CHAT CON INTELIGENCIA ARTIFICIAL ---
     st.markdown("---")
+    st.subheader("💬 Consultar con IA")
+    
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
     for m in st.session_state.messages:
         with st.chat_message(m["role"]):
-            st.write(m["content"])
+            st.markdown(m["content"])
 
-    if p := st.chat_input("Ej: ¿Cuántas veces faltó el P00 123456?"):
+    if p := st.chat_input("Ej: ¿Cuántas vacaciones tiene el P00 123456 este mes?"):
         st.session_state.messages.append({"role": "user", "content": p})
-        with st.chat_message("user"): st.write(p)
+        with st.chat_message("user"):
+            st.markdown(p)
 
-        if client:
+        if not client:
+            st.warning("Falta la clave de API de Groq en los secretos.")
+        else:
             try:
-                # 1. Generar SQL usando el esquema real
-                sys_sql = "Responde SOLO con el código SQL SELECT para SQLite. Tabla: asistencia_diaria. Columnas: fecha, identificador, nombre_trabajador, departamento, estatus."
+                # 1. Generación de SQL
+                sys_sql = (
+                    "Eres un experto en SQLite. Tabla: 'asistencia_diaria'. "
+                    "Columnas: fecha, identificador, nombre_trabajador, departamento, estatus. "
+                    "Responde SOLO con el código SQL SELECT."
+                )
                 res_sql = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=[{"role": "system", "content": sys_sql}, {"role": "user", "content": p}],
                     temperature=0
                 )
-                sql_limpio = res_sql.choices[0].message.content.strip().replace("```sql", "").replace("
-```", "")
                 
-                # 2. Consultar y Resumir
-                res_df = pd.read_sql(sql_limpio, conn)
+                # Limpieza del SQL generado
+                sql_final = res_sql.choices[0].message.content.strip()
+                sql_final = sql_final.replace("```sql", "").replace("
+```", "").replace(";", "")
+                
+                # 2. Ejecución y Resumen
+                df_res = pd.read_sql(sql_final, conn)
+                
                 res_ia = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=[
-                        {"role": "system", "content": "Eres un analista de RRHH para ggi. Explica los datos brevemente. Identificadores de 6 números son P00, otros son CI."},
-                        {"role": "user", "content": f"Datos: {res_df.to_json()} \nPregunta: {p}"}
+                        {"role": "system", "content": "Eres un analista de RRHH para ggi. Explica los resultados de forma directa. Recuerda: 6 dígitos es P00, más es CI."},
+                        {"role": "user", "content": f"Pregunta: {p} \n Datos obtenidos: {df_res.to_json(orient='records')}"}
                     ]
                 )
-                msg_ia = res_ia.choices[0].message.content
-                with st.chat_message("assistant"): st.write(msg_ia)
-                st.session_state.messages.append({"role": "assistant", "content": msg_ia})
-            except:
-                st.error("No pude procesar esa consulta. Verifica que los datos estén cargados.")
+                
+                respuesta = res_ia.choices[0].message.content
+                with st.chat_message("assistant"):
+                    st.markdown(respuesta)
+                st.session_state.messages.append({"role": "assistant", "content": respuesta})
+                
+            except Exception as e:
+                error_msg = "No encontré datos suficientes para esa consulta o el formato es inválido."
+                st.error(f"{error_msg} (Detalle: {e})")
 
 if __name__ == "__main__":
     main()
